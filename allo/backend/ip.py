@@ -8,9 +8,34 @@ import importlib
 import subprocess
 import time
 
-# Regex token that matches both plain C types (int8_t, float) and
-# HLS-style template types (ap_int<8>, ap_uint<16>).
-_TYPE_TOKEN = r"(?:ap_u?int<\d+>|\w+)"
+# Template argument list allowing one level of nesting, so that both `int8_t`
+# and `ap_int<8>` work as the argument of an outer template.
+_TEMPLATE_ARGS = r"[^<>]*(?:<[^<>]*>[^<>]*)*"
+
+# Regex token that matches plain C types (int8_t, float), HLS-style template
+# types (ap_int<8>, ap_uint<16>) and namespace-qualified templates as emitted
+# by EmitVivadoHLS (`hls::stream< int8_t >`, `hls::stream< ap_int<8> >`).
+# The template alternative must come first: otherwise the bare `\w+` branch
+# would match only the head of `hls::stream<...>`.
+_TYPE_TOKEN = rf"(?:(?:\w+::)*\w+\s*<{_TEMPLATE_ARGS}>|\w+)"
+
+# An `hls::stream<T>`, which HLS code always passes by reference.
+_STREAM_TOKEN = rf"(?:\w+::)*stream\s*<{_TEMPLATE_ARGS}>"
+
+
+class _StreamShape:
+    """Sentinel shape for an ``hls::stream<T> &`` parameter.
+
+    It is deliberately not sized: a stream is neither a scalar ``()``, an array
+    (tuple of dims), nor a pointer ``None``, so shape-dispatching code fails
+    loudly rather than silently emitting a bad cast for it.
+    """
+
+    def __repr__(self):
+        return "STREAM"
+
+
+STREAM = _StreamShape()
 
 
 def resolve_nb_type(hls_type: str) -> str:
@@ -40,6 +65,8 @@ def parse_cpp_function(code, target_function):
             - shape is a tuple of dimensions for arrays
             - shape is () for scalars
             - shape is None for pointers
+            - shape is STREAM for hls::stream<T> references, in which case the
+              type is the stream type as written, e.g. "hls::stream<int8_t>"
     """
     # Function pattern that works for both declarations and definitions
     function_pattern = r"(\w+)\s+" + re.escape(target_function) + r"\s*\((.*?)\)\s*[{;]"
@@ -53,7 +80,13 @@ def parse_cpp_function(code, target_function):
     # return_type = function_match.group(1)
     params_str = function_match.group(2)
 
-    # Split parameters
+    # Drop inline comments: EmitVivadoHLS annotates stream parameters with
+    # their depth (`hls::stream<int8_t> &v0 /* v0[2] */`), which would
+    # otherwise look like array dimensions.
+    params_str = re.sub(r"/\*.*?\*/", " ", params_str, flags=re.DOTALL)
+
+    # Split parameters. Angle brackets are tracked alongside square ones so a
+    # comma inside a template argument list does not split a parameter.
     params = []
     current_param = ""
     bracket_count = 0
@@ -64,9 +97,9 @@ def parse_cpp_function(code, target_function):
             current_param = ""
         else:
             current_param += char
-            if char == "[":
+            if char in "[<":
                 bracket_count += 1
-            elif char == "]":
+            elif char in "]>":
                 bracket_count -= 1
 
     if current_param.strip():
@@ -74,8 +107,19 @@ def parse_cpp_function(code, target_function):
 
     # Process each parameter to extract type and shape.
     # We use _TYPE_TOKEN so that HLS types like ap_int<8> are captured whole.
+    # We also added _STREAM_TOKEN to capture streams at the interface
     result = []
     for param in params:
+        # Check if parameter is an hls::stream reference. This must be tried
+        # before the scalar pattern, whose `\w+` type branch would otherwise
+        # match the element type inside the angle brackets.
+        stream_pattern = rf"({_STREAM_TOKEN})\s*&\s*(\w+)"
+        stream_match = re.search(stream_pattern, param)
+
+        if stream_match:
+            result.append((stream_match.group(1), STREAM))
+            continue
+
         # Check if parameter is a pointer
         pointer_pattern = rf"({_TYPE_TOKEN})\s+\*(\w+)"
         pointer_match = re.search(pointer_pattern, param)
@@ -113,7 +157,24 @@ def parse_cpp_function(code, target_function):
 
 
 class IPModule:
-    def __init__(self, top, impl, include_paths=None, link_hls=True):
+    def __init__(
+        self,
+        top,
+        impl,
+        include_paths=None,
+        link_hls=True,
+        input_idx=None,
+        output_idx=None,
+    ):
+        # ``input_idx`` / ``output_idx`` declare, per argument position, whether
+        # the IP *reads* (input) or *writes* (output) that argument. They are
+        # only required for arguments the tool cannot direct on its own -- most
+        # importantly ``hls::stream<T> &`` ports, which use the same C++ syntax
+        # whether the IP reads or writes them (see ``_StreamShape``). They mirror
+        # the AIE ``ExternalModule`` API; the IR builder reads ``obj.input_idx``.
+        # Default ``None`` preserves the historic memref/scalar behaviour.
+        self.input_idx = input_idx
+        self.output_idx = output_idx
         self.top = top
         self.impl = os.path.abspath(os.path.expanduser(impl))
         if not os.path.exists(self.impl):
@@ -150,7 +211,27 @@ class IPModule:
         self.lib_name = f"py{self.top}_{hash(time.time_ns())}"
         self.c_wrapper_file = os.path.join(self.temp_path, f"{self.lib_name}.cpp")
 
+    @property
+    def has_stream_args(self):
+        """True if any argument is an ``hls::stream<T> &`` port.
+
+        Such an IP can only be integrated for the HLS targets (vitis_hls /
+        vivado_hls). The CPU paths below reinterpret-cast raw pointers and have
+        no way to represent a stream, so they refuse it up front.
+        """
+        return any(shape is STREAM for _, shape in self.args)
+
+    def _reject_stream_on_cpu(self):
+        if self.has_stream_args:
+            raise NotImplementedError(
+                f"IP '{self.top}' has hls::stream<T> arguments, which are only "
+                "supported for the vitis_hls/vivado_hls targets (csyn and "
+                "beyond). They cannot run on the CPU 'llvm'/'simulator' targets "
+                "or in vitis_hls 'csim' mode."
+            )
+
     def generate_nanobind_wrapper(self):
+        self._reject_stream_on_cpu()
         out_str = "// Auto-generated by Allo\n\n"
         # Standard headers
         out_str += "#include <cstdint>\n"
@@ -339,6 +420,7 @@ class IPModule:
             ) from exc
 
     def generate_mlir_c_wrapper(self):
+        self._reject_stream_on_cpu()
         out_str = "// Auto-generated by Allo\n\n"
         # Add headers
         out_str += "#include <iostream>\n"
@@ -407,13 +489,19 @@ class IPModule:
                     f"Failed to compile {src.split('/')[-1]}.o!"
                 ) from exc
             obj_files.append(obj)
-        cmd = f"g++ -shared -o {self.temp_path}/lib{self.top}.so " + " ".join(obj_files)
+        # Name the .so after lib_name (which carries a per-instance hash), not
+        # self.top: two IPModules wrapping the same top function would otherwise
+        # both write lib<top>.so, and the second overwrites the first -- so the
+        # first module's JIT can no longer find its (uniquely-named) symbol when
+        # both live in one process (e.g. two tests in one pytest run).
+        so_path = f"{self.temp_path}/lib{self.lib_name}.so"
+        cmd = f"g++ -shared -o {so_path} " + " ".join(obj_files)
         print(cmd)
         try:
             subprocess.check_output(cmd, shell=True)
         except subprocess.CalledProcessError as exc:
-            raise RuntimeError(f"Failed to compile {self.top}.so!") from exc
-        return f"{self.temp_path}/lib{self.top}.so"
+            raise RuntimeError(f"Failed to compile {so_path}!") from exc
+        return so_path
 
     def __call__(self, *args):
         self.compile_nanobind()

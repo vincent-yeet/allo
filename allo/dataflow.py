@@ -123,6 +123,22 @@ def move_stream_to_interface(
                         # These don't strictly define direction, but we need to choose one
                         # to avoid the error. Default to 'in' for empty (consumer) and 'out' for full (producer)
                         direction = "in" if isinstance(use.owner, allo_d.StreamEmptyOp) else "out"
+                    elif isinstance(use.owner, func_d.CallOp):
+                        # A call to an external HLS IP that takes the stream as a
+                        # port. A func.call is neither a StreamPut nor a StreamGet,
+                        # so direction cannot be inferred from the op kind. The
+                        # builder recorded it in a `stream_dirs` string attribute
+                        # (one char per operand: 'i' input, 'o' output, '_' other)
+                        # from the IP's input_idx/output_idx. `operand_number` is
+                        # this stream's position among the call's operands.
+                        if "stream_dirs" not in use.owner.attributes:
+                            raise ValueError(
+                                f"Stream passed to call {use.owner.attributes['callee']} "
+                                "without a stream_dirs attribute; the IPModule must "
+                                "declare input_idx/output_idx for its stream ports."
+                            )
+                        dirs = use.owner.attributes["stream_dirs"].value
+                        direction = "in" if dirs[use.operand_number] == "i" else "out"
                     else:
                         raise ValueError(f"Stream is not used correctly: {use.owner}")
                 if with_stream_type and stream_name not in stream_types_dict:
