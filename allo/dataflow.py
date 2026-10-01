@@ -122,7 +122,11 @@ def move_stream_to_interface(
                     ):
                         # These don't strictly define direction, but we need to choose one
                         # to avoid the error. Default to 'in' for empty (consumer) and 'out' for full (producer)
-                        direction = "in" if isinstance(use.owner, allo_d.StreamEmptyOp) else "out"
+                        direction = (
+                            "in"
+                            if isinstance(use.owner, allo_d.StreamEmptyOp)
+                            else "out"
+                        )
                     elif isinstance(use.owner, func_d.CallOp):
                         # A call to an external HLS IP that takes the stream as a
                         # port. A func.call is neither a StreamPut nor a StreamGet,
@@ -335,7 +339,11 @@ def move_stream_to_interface(
                     elif isinstance(
                         use.owner, (allo_d.StreamEmptyOp, allo_d.StreamFullOp)
                     ):
-                        direction = "in" if isinstance(use.owner, allo_d.StreamEmptyOp) else "out"
+                        direction = (
+                            "in"
+                            if isinstance(use.owner, allo_d.StreamEmptyOp)
+                            else "out"
+                        )
                     else:
                         raise ValueError(f"Stream is not used correctly: {use.owner}")
                 stream_name = op.attributes["name"].value
@@ -685,6 +693,11 @@ def build(
             unroll=False,
             typing_rule_set="cpp-style",
         )
+        from .backend.rtl import RTLModule
+
+        for lib in s.ext_libs:
+            if isinstance(lib, RTLModule):
+                lib.validate_target(target)
         stream_info, stream_types_dict, extra_stream_info = move_stream_to_interface(
             s, with_stream_type=True, with_extra_info=True, unroll=False
         )

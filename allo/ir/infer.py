@@ -1194,6 +1194,7 @@ class TypeInferer(ASTVisitor):
 
         # Local imports to avoid cyclic dependencies
         from ..backend.ip import IPModule
+        from ..backend.rtl import RTLModule
 
         try:
             from ..backend.aie.vliw import VLIWKernelFunction
@@ -1225,6 +1226,8 @@ class TypeInferer(ASTVisitor):
                 # HLS IP, suppose it does not have return values
                 # Also, it has NO side effect, which means it does not change the shape/dtype of the input
                 visit_stmts(ctx, node.args)
+                if isinstance(obj, RTLModule):
+                    obj.validate_arguments(node.args)
                 node.shape = None
                 node.dtype = None
                 return node

@@ -41,6 +41,7 @@ from .catapult import (
     parse_catapult_hierarchical_report,
 )
 from .ip import IPModule
+from .rtl import RTLModule
 from .report import parse_xml
 from ..passes import (
     _mlir_lower_pipeline,
@@ -75,8 +76,11 @@ def _find_catapult_binary():
     if os.path.isdir(siemens_root):
         # Pick the most recent version (sort descending)
         versions = sorted(
-            (d for d in os.listdir(siemens_root)
-             if os.path.isdir(os.path.join(siemens_root, d))),
+            (
+                d
+                for d in os.listdir(siemens_root)
+                if os.path.isdir(os.path.join(siemens_root, d))
+            ),
             reverse=True,
         )
         for ver in versions:
@@ -169,6 +173,8 @@ open_solution "solution1"
 
 def copy_ext_libs(ext_libs, project):
     for ext_lib in ext_libs:
+        if isinstance(ext_lib, RTLModule):
+            continue
         impl_path = ext_lib.impl
         cpp_file = impl_path.split("/")[-1]
         assert cpp_file != "kernel.cpp", "kernel.cpp is reserved for the top function"
@@ -237,6 +243,9 @@ class HLSModule:
         self.project = project
         self.platform = platform
         self.ext_libs = [] if ext_libs is None else ext_libs
+        for lib in self.ext_libs:
+            if isinstance(lib, RTLModule):
+                lib.validate_hls(platform, mode)
         self.num_output_args = None  # Will be set from configs if provided
         user_configs = configs if configs is not None else {}
         # For Catapult (ASIC), start with ASIC-appropriate defaults instead of FPGA defaults.
@@ -388,6 +397,8 @@ class HLSModule:
                     with open(cfg_path, "w", encoding="utf-8") as cfg_file:
                         cfg_file.write(cfg_content)
                 for lib in self.ext_libs:
+                    if isinstance(lib, RTLModule):
+                        continue
                     cpp_file = lib.impl.split("/")[-1]
                     with open(f"{project}/{cpp_file}", "r", encoding="utf-8") as infile:
                         new_code = postprocess_hls_code(
@@ -524,6 +535,32 @@ class HLSModule:
                     outfile.write(self.host_code)
             if len(ext_libs) > 0:
                 for lib in ext_libs:
+                    if isinstance(lib, RTLModule):
+                        header, manifest = lib.export_hls(project)
+                        kernel_path = os.path.join(project, "kernel.cpp")
+                        with open(kernel_path, encoding="utf-8") as infile:
+                            code = infile.read()
+                        with open(kernel_path, "w", encoding="utf-8") as outfile:
+                            outfile.write(f'#include "{header}"\n' + code)
+                        tcl_path = os.path.join(project, "run.tcl")
+                        with open(tcl_path, encoding="utf-8") as infile:
+                            tcl = infile.read()
+                        # Vitis rejects ap_ctrl_chain black boxes in pipeline
+                        # regions, including automatically pipelined call loops.
+                        if "config_compile -pipeline_loops 0" not in tcl:
+                            tcl = tcl.replace(
+                                "# Run HLS",
+                                "# RTLModule calls must remain sequential.\n"
+                                "config_compile -pipeline_loops 0\n\n# Run HLS",
+                            )
+                        with open(tcl_path, "w", encoding="utf-8") as outfile:
+                            outfile.write(
+                                tcl.replace(
+                                    "# Add design and testbench files",
+                                    f"# Add design and testbench files\nadd_files -blackbox {{{manifest}}}",
+                                )
+                            )
+                        continue
                     # Update kernel.cpp
                     new_kernel = ""
                     with open(
@@ -911,7 +948,9 @@ class HLSModule:
                 catapult_cmd = _find_catapult_binary()
 
                 cmd = f"cd {self.project}; {catapult_cmd} -shell -f run.tcl"
-                assert len(args) == 0, f"{self.mode} mode does not need to pass in arguments"
+                assert (
+                    len(args) == 0
+                ), f"{self.mode} mode does not need to pass in arguments"
                 print(
                     f"[{time.strftime('%H:%M:%S', time.gmtime())}] Begin synthesizing project with Catapult HLS ({self.mode} mode)..."
                 )

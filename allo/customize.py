@@ -1277,6 +1277,11 @@ class Schedule:
         wrap_io=True,
         use_memory=False,
     ):
+        from .backend.rtl import RTLModule
+
+        for lib in self.ext_libs:
+            if isinstance(lib, RTLModule):
+                lib.validate_target(target)
         if target is None or target == "llvm":
             target = "llvm"
             return LLVMModule(
